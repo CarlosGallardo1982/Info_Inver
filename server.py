@@ -206,10 +206,10 @@ def empirical_prob_now(ticker: str, interval: str, horizon: str):
     def filter_similar(center, scale):
         tols = {k: (v if k=="ema_flag" else v*scale) for k,v in tol.items()}
         m = (
-            feats["rsi"].between(center["rsi"]-tols["rsi"], center["rsi"]+tols["rsi"]) &&
-            feats["macd_unit"].between(center["macd_unit"]-tols["macd_unit"], center["macd_unit"]+tols["macd_unit"]) &&
-            feats["trend"].between(center["trend"]-tols["trend"], center["trend"]+tols["trend"]) &&
-            feats["band_pos"].between(center["band_pos"]-tols["band_pos"], center["band_pos"]+tols["band_pos"]) &&
+            feats["rsi"].between(center["rsi"]-tols["rsi"], center["rsi"]+tols["rsi"]) &
+            feats["macd_unit"].between(center["macd_unit"]-tols["macd_unit"], center["macd_unit"]+tols["macd_unit"]) &
+            feats["trend"].between(center["trend"]-tols["trend"], center["trend"]+tols["trend"]) &
+            feats["band_pos"].between(center["band_pos"]-tols["band_pos"], center["band_pos"]+tols["band_pos"]) &
             (feats["ema_flag"] == int(center["ema_flag"]))
         )
         return feats[m]
