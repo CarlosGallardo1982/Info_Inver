@@ -1,353 +1,327 @@
-# server.py — Bot Telegram vía webhook en Render (gratis)
-# Uso educativo. No es asesoría financiera.
+# bot.py — Bot SOLO para TRON (TRX). Timeframes: h, d, w, m, y
+# Comandos:
+#   /start
+#   /info TRX h|d|w|m|y
+#
+# Mejoras:
+# - Zona horaria fija (America/Mexico_City)
+# - Bollinger: umbrales claros (>=0.80 sobrecompra, <=-0.80 sobreventa)
+# - Mensajes claros (Precio → SMA/EMA → RSI → MACD → Bollinger → Prob.)
+# - Probabilidad “capada” por horizonte para no exagerar en plazos largos
+# - yfinance con threads=True
+# - Aviso: Solo propósitos informativos (no asesoría)
 
-import os, math, html, time, asyncio
-from datetime import datetime
-from typing import Optional
-
+import os, math
+from datetime import datetime, timezone
+import zoneinfo
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse
-import uvicorn
-
 from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# =================== Config & Credenciales ===================
-BOT_TOKEN   = os.environ.get("BOT_TOKEN")      # <-- OBLIGATORIO (ponerlo en Render)
-PUBLIC_URL  = os.environ.get("PUBLIC_URL", "") # <-- Se pondrá después del primer deploy
-APP_NAME    = "SignalInver"
+# -------------------- Config TRX-only --------------------
+TRX_ALIASES = {"TRX", "TRX-USD", "TRXUSD", "TRX/USDT", "TRXUSDT"}
+TRX_CANONICAL = "TRX-USD"  # símbolo en yfinance
+VALID_TF = {"h","d","w","m","y"}  # sin "1"
+MX_TZ = zoneinfo.ZoneInfo("America/Mexico_City")
 
-ALLOWED_INTERVALS = {"1d","1h","30m","15m","5m"}     # velas
-ALLOWED_HORIZONS  = {"1d","1w","1m","1y"}            # horizonte
-DEFAULT_INTERVAL  = "1d"
-DEFAULT_HORIZON   = "1d"
-CACHE_TTL         = 60
-CACHE = {}
+def is_trx(t: str) -> bool:
+    return (t or "").upper().strip() in TRX_ALIASES or (t or "").upper().strip() == "TRX-USD"
 
-def safe(x:str)->str: return html.escape(str(x))
+def fmt(x, nd=2):
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "—"
+    try:
+        return f"{x:,.{nd}f}"
+    except Exception:
+        return str(x)
 
-# Alias de tickers comunes → yfinance
-TICKER_MAP = {
-    "BTC":"BTC-USD", "ETH":"ETH-USD",
-    "SPX":"^GSPC", "SP500":"^GSPC", "S&P500":"^GSPC",
-    "NDX":"^NDX", "DOW":"^DJI",
-    "QQQ":"QQQ", "NVDA":"NVDA", "AAPL":"AAPL",
-    "GOLD":"GC=F", "XAU":"GC=F",
-    "OIL":"CL=F", "WTI":"CL=F", "BRENT":"BZ=F",
-    "EURUSD":"EURUSD=X", "DXY":"DX-Y.NYB",
-}
-def norm_ticker(t:str)->str: return TICKER_MAP.get(t.upper().strip(), t.upper().strip())
+def ts_local_utc(now=None):
+    now_utc = (now or datetime.now(timezone.utc))
+    utc = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    local_dt = now_utc.astimezone(MX_TZ)
+    local = local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    return local, utc
 
-def _get_cached(key, ttl): 
-    x = CACHE.get(key)
-    return x["data"] if x and (time.time()-x["ts"]<=ttl) else None
-def _set_cached(key, data): 
-    CACHE[key] = {"ts": time.time(), "data": data}
+# -------------------- Indicadores --------------------
+def rsi_series(close: pd.Series, n=14) -> pd.Series:
+    d = close.diff()
+    up = d.clip(lower=0.0)
+    down = (-d).clip(lower=0.0)
+    ru = up.ewm(alpha=1/n, adjust=False).mean()
+    rd = down.ewm(alpha=1/n, adjust=False).mean()
+    rs = ru / rd.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-# =================== Indicadores ===================
-def sma(s,n): return s.rolling(n).mean()
-def ema(s,n): return s.ewm(span=n, adjust=False).mean()
-
-def rsi(s, n=14):
-    d=s.diff(); up=d.clip(lower=0); down=-d.clip(upper=0)
-    ru=up.ewm(alpha=1/n, adjust=False).mean()
-    rd=down.ewm(alpha=1/n, adjust=False).mean()
-    rs=ru/rd.replace(0, np.nan)
-    return 100-(100/(1+rs))
-
-def macd(s, fast=12, slow=26, signal=9):
-    ef=s.ewm(span=fast, adjust=False).mean()
-    es=s.ewm(span=slow, adjust=False).mean()
-    line=ef-es
-    sig=line.ewm(span=signal, adjust=False).mean()
-    hist=line-sig
+def macd_series(close: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    line = ema_fast - ema_slow
+    sig = line.ewm(span=signal, adjust=False).mean()
+    hist = line - sig
     return line, sig, hist
 
-def bollinger(close, n=20, k=2):
-    mid  = close.rolling(n).mean()
-    sd   = close.rolling(n).std()
-    up   = mid + k*sd
-    low  = mid - k*sd
-    return up, mid, low, sd
+# -------------------- Datos --------------------
+def fetch_candles_for_tf(ticker: str, tf: str) -> pd.DataFrame:
+    """Devuelve DataFrame según tf humano (h/d/w/m/y)."""
+    if tf == "h":
+        interval = "1h";  period = "60d"
+    elif tf == "d":
+        interval = "1d";  period = "2y"
+    elif tf == "w":
+        interval = "1wk"; period = "5y"
+    elif tf == "m":
+        interval = "1mo"; period = "20y"
+    elif tf == "y":
+        interval = "1mo"; period = "20y"
+    else:
+        raise ValueError("Timeframe no soportado")
 
-def tag_rsi(v):
-    if v>=70: return "Sobrecompra"
-    if v<=30: return "Sobreventa"
-    return "Neutro"
-
-def tag_macd(line, sig): return "Alcista" if line>sig else "Bajista"
-
-def tag_boll(pos):
-    if pos>=1:  return "Sobrecompra (arriba banda)"
-    if pos<=-1: return "Sobreventa (abajo banda)"
-    return "Dentro de bandas"
-
-def trend_tag(s50, s200):
-    return "Tendencia alcista (SMA50>SMA200)" if s50>s200 else "Tendencia bajista (SMA50<SMA200)"
-
-# =================== Datos ===================
-def load_prices(ticker, interval):
-    key=("prices",ticker,interval)
-    df=_get_cached(key, CACHE_TTL)
-    if df is not None: return df
-    if interval=="1d": period="3y"
-    elif interval in {"1h","30m","15m"}: period="180d"
-    else: period="60d"
-    df=yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-    if df is None or df.empty or "Close" not in df.columns:
-        raise ValueError("Sin datos para ese ticker/intervalo.")
-    df["Close"]=df["Close"].astype(float)
-    _set_cached(key, df)
+    df = yf.download(
+        tickers=ticker,
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=False,
+        group_by="column",
+        threads=True,   # ayuda a reducir latencia
+        prepost=False,
+    )
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
     return df
 
-def build_ta_summary(ticker, interval):
-    df=load_prices(ticker, interval)
-    c=df["Close"].dropna()
-    if len(c)<220: raise ValueError("Pocos datos; prueba 1d u otro ticker.")
-    rsi14=rsi(c,14)
-    mline, msig, mhist = macd(c)
-    up, mid, low, sd = bollinger(c,20,2)
-    s50=sma(c,50); s200=sma(c,200); e20=ema(c,20)
+def get_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
+    if "Close" in df.columns and not isinstance(df["Close"], pd.DataFrame):
+        return df["Close"].dropna().astype(float)
 
-    # timestamps
-    idx = c.index[-1]
-    ts = pd.Timestamp(idx)
-    if ts.tzinfo is None:
-        candle_utc = ts.tz_localize("UTC")
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            sub = df.xs("Close", axis=1, level=0)
+        except KeyError:
+            try:
+                sub = df.xs("Close", axis=1, level=1)
+            except KeyError:
+                sub = None
+        if sub is not None:
+            if isinstance(sub, pd.DataFrame):
+                s = sub[ticker] if ticker in sub.columns else sub.iloc[:, 0]
+            else:
+                s = sub
+            return s.dropna().astype(float)
+
+    if "Adj Close" in df.columns:
+        s = df["Adj Close"]
+        if isinstance(s, pd.DataFrame):
+            s = s.squeeze()
+        return s.dropna().astype(float)
+
+    raise ValueError("No se encontró columna Close/Adj Close en el DataFrame")
+
+# -------------------- Features --------------------
+def ta_features(df: pd.DataFrame, ticker: str, tf: str) -> dict:
+    if df is None or df.empty:
+        raise ValueError("Sin datos")
+    close = get_close_series(df, ticker)
+    if close.empty:
+        raise ValueError("Sin cierres válidos")
+
+    last_price = float(close.iloc[-1])
+
+    rsi = rsi_series(close, 14)
+    rsi14 = float(rsi.iloc[-1]) if not rsi.empty else np.nan
+
+    macd_line, macd_sig, macd_hist = macd_series(close)
+    mline = float(macd_line.iloc[-1])
+    msig  = float(macd_sig.iloc[-1])
+    mhist = float(macd_hist.iloc[-1])
+
+    # Bollinger 20,2
+    ma20 = close.rolling(20).mean()
+    sd20 = close.rolling(20).std(ddof=0)
+    if len(close) >= 20 and not np.isnan(sd20.iloc[-1]) and sd20.iloc[-1] != 0:
+        m  = float(ma20.iloc[-1])
+        s  = float(sd20.iloc[-1])
+        k  = 2.0
+        bb_pos = (last_price - m) / (k*s)
     else:
-        candle_utc = ts.tz_convert("UTC")
-    local_tz = datetime.now().astimezone().tzinfo
-    candle_local = candle_utc.tz_convert(local_tz)
-    now_local = datetime.now().astimezone()
+        bb_pos = np.nan
 
-    last=dict(
-        price=float(c.iloc[-1]),
-        rsi=float(rsi14.iloc[-1]),
-        macd_line=float(mline.iloc[-1]),
-        macd_sig=float(msig.iloc[-1]),
-        macd_hist=float(mhist.iloc[-1]),
-        bb_upper=float(up.iloc[-1]),
-        bb_mid=float(mid.iloc[-1]),
-        bb_lower=float(low.iloc[-1]),
-        sma50=float(s50.iloc[-1]),
-        sma200=float(s200.iloc[-1]),
-        ema20=float(e20.iloc[-1]),
-        band_pos=0.0,
-        candle_local=candle_local,
-        candle_utc=candle_utc,
-        now_local=now_local
-    )
-    band_half=(last["bb_upper"]-last["bb_lower"])/2
-    last["band_pos"]=0.0 if band_half==0 else (last["price"]-last["bb_mid"])/band_half
+    def last_ma(series, n):
+        return float(series.rolling(n).mean().iloc[-1]) if len(series) >= n else np.nan
 
-    tags=dict(
-        rsi=tag_rsi(last["rsi"]),
-        macd=tag_macd(last["macd_line"], last["macd_sig"]),
-        boll=tag_boll(last["band_pos"]),
-        trend=trend_tag(last["sma50"], last["sma200"]),
-        ema20="Precio>EMA20" if last["price"]>last["ema20"] else "Precio<EMA20",
-    )
-    return last, tags
+    # Medias en unidades del TF
+    sma50  = last_ma(close, 50)
+    sma200 = last_ma(close, 200)
+    ema20  = float(close.ewm(span=20, adjust=False).mean().iloc[-1]) if len(close) >= 20 else np.nan
 
-# =================== Probabilidad histórica ===================
-def sigmoid(x): return 1/(1+math.exp(-x))
+    # Alternativas anuales (meses) para vista 'y'
+    sma12m = last_ma(close, 12)
+    sma24m = last_ma(close, 24)
 
-def _horizon_steps(h: str) -> int:
-    return {"1d": 1, "1w": 5, "1m": 21, "1y": 252}.get(h, 1)
+    # Timestamps
+    last_idx = close.index[-1]
+    try:
+        last_local = last_idx.to_pydatetime().astimezone(MX_TZ)
+        last_utc   = last_idx.tz_convert("UTC").to_pydatetime()
+    except Exception:
+        last_local = pd.Timestamp(last_idx).to_pydatetime().astimezone(MX_TZ)
+        last_utc   = pd.Timestamp(last_idx).to_pydatetime()
 
-def _prep_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
-    c = df["Close"].astype(float).copy()
-    rsi14 = rsi(c, 14)
-    mline, msig, mhist = macd(c)
-    up, mid, low, sd = bollinger(c, 20, 2)
-    s50, s200 = sma(c, 50), sma(c, 200)
-    e20 = ema(c, 20)
-    feat = pd.DataFrame(index=c.index)
-    feat["price"] = c
-    feat["rsi"] = rsi14
-    feat["macd_unit"] = (mhist / c.replace(0, np.nan)) / 0.005
-    feat["trend"] = (s50 - s200) / s200.replace(0, np.nan)
-    band_half = (up - low) / 2
-    feat["band_pos"] = (c - mid) / band_half.replace(0, np.nan)
-    feat["ema_flag"] = (c > e20).astype(int)
-    return feat
-
-def _wilson_interval(p: float, n: int, z: float = 1.96):
-    if n == 0: return (0.0, 0.0)
-    denominator = 1 + z*z/n
-    centre = p + z*z/(2*n)
-    margin = z * ((p*(1-p)/n + z*z/(4*n*n))**0.5)
-    low = (centre - margin)/denominator
-    high = (centre + margin)/denominator
-    return (max(0.0, low), min(1.0, high))
-
-def empirical_prob_now(ticker: str, interval: str, horizon: str):
-    df_daily = load_prices(ticker, "1d")
-    feats = _prep_feature_frame(df_daily).dropna().copy()
-    if feats.empty: return {"mode":"heuristic"}
-
-    # estado actual (en diario)
-    last_daily, _ = build_ta_summary(ticker, "1d")
-
-    steps = _horizon_steps(horizon)
-    fut_ret = feats["price"].pct_change(steps).shift(-steps)
-    feats["fut_win"] = (fut_ret > 0).astype(float)
-    feats = feats.iloc[:-steps].dropna().copy()
-    if feats.empty: return {"mode":"heuristic"}
-
-    # tolerancias base
-    tol = {"rsi":5.0, "macd_unit":0.5, "trend":0.02, "band_pos":0.30, "ema_flag":0}
-
-    def filter_similar(center, scale):
-        tols = {k: (v if k=="ema_flag" else v*scale) for k,v in tol.items()}
-        m = (
-            feats["rsi"].between(center["rsi"]-tols["rsi"], center["rsi"]+tols["rsi"]) &
-            feats["macd_unit"].between(center["macd_unit"]-tols["macd_unit"], center["macd_unit"]+tols["macd_unit"]) &
-            feats["trend"].between(center["trend"]-tols["trend"], center["trend"]+tols["trend"]) &
-            feats["band_pos"].between(center["band_pos"]-tols["band_pos"], center["band_pos"]+tols["band_pos"]) &
-            (feats["ema_flag"] == int(center["ema_flag"]))
-        )
-        return feats[m]
-
-    center = {
-        "rsi": last_daily["rsi"],
-        "macd_unit": (last_daily["macd_hist"]/max(1e-8, last_daily["price"])) / 0.005,
-        "trend": (last_daily["sma50"]-last_daily["sma200"])/max(1e-8, last_daily["sma200"]),
-        "band_pos": last_daily["band_pos"],
-        "ema_flag": 1 if last_daily["price"]>last_daily["ema20"] else 0,
+    return {
+        "price": last_price,
+        "rsi14": rsi14,
+        "macd_line": mline,
+        "macd_signal": msig,
+        "macd_hist": mhist,
+        "bb_pos": bb_pos,
+        "sma50": sma50,
+        "sma200": sma200,
+        "ema20": ema20,
+        "sma12m": sma12m,
+        "sma24m": sma24m,
+        "ts_local": last_local.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "ts_utc":   last_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
 
-    selected = None
-    for target_n in (50, 100, 200):
-        for sc in (1.0, 1.5, 2.0, 3.0):
-            cand = filter_similar(center, sc)
-            if len(cand) >= target_n:
-                selected = cand
-                break
-        if selected is not None:
-            break
-    if selected is None:
-        selected = filter_similar(center, 3.0)
+# -------------------- Etiquetas + Prob --------------------
+def label_rsi(v):
+    if np.isnan(v): return "—"
+    if v >= 70: return "Sobrecompra"
+    if v <= 30: return "Sobreventa"
+    return "Neutro"
 
-    n = int(len(selected))
-    if n == 0: return {"mode":"heuristic"}
-    p = float(selected["fut_win"].mean())
-    lo, hi = _wilson_interval(p, n)
-    return {"mode":"empirical", "n": n, "p_up": p, "p_dn": 1.0-p, "ci_low": lo, "ci_high": hi}
+def label_macd(line, sig):
+    if np.isnan(line) or np.isnan(sig): return "—"
+    return "Alcista" if line > sig else "Bajista"
 
-# =================== /info único ===================
-def parse_args(args):
-    """
-    /info TICKER [tf]
-    tf: velas -> 1d,1h,30m,15m,5m  |  horizonte -> 1d,1w,1m,1y
-    """
-    if not args: return None, None, None
-    t = norm_ticker(args[0])
-    if len(args)>=2:
-        tf = args[1].lower().strip()
-        if tf in ALLOWED_INTERVALS:
-            return t, tf, "1d"
-        if tf in ALLOWED_HORIZONS:
-            return t, "1d", tf
-    return t, DEFAULT_INTERVAL, DEFAULT_HORIZON
+def label_trend(sma50, sma200):
+    if np.isnan(sma50) or np.isnan(sma200): return "—"
+    return "Alcista (50>200)" if sma50 > sma200 else "Bajista (50<=200)"
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg=(
-        "Hola 👋 Soy un bot de análisis técnico educativo.\n\n"
-        "Usa /info TICKER [tf]\n"
-        "• tf velas: 1d, 1h, 30m, 15m, 5m  (intervalo)\n"
-        "• tf horizonte: 1d, 1w, 1m, 1y (probabilidad histórica)\n\n"
-        "Ejemplos: /info BTC 1d  •  /info BTC 1w  •  /info AAPL 1m\n"
-        "<i>Alias normalizados (BTC→BTC-USD). Uso educativo; no asesoría.</i>"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+def label_bollinger(pos):
+    if np.isnan(pos): return "—"
+    if pos >=  0.8:  return "Sobrecompra"
+    if pos <= -0.8:  return "Sobreventa"
+    if -0.3 <= pos <= 0.3: return "Zona media"
+    return "Intermedia"
 
-async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text(
-            "Formato: /info TICKER [tf]\n"
-            "Ejemplos: /info BTC 1d  |  /info BTC 1w  |  /info AAPL 1m\n"
-            "tf velas: 1d, 1h, 30m, 15m, 5m  |  horizonte: 1d, 1w, 1m, 1y"
-        ); return
-    t, interval, horizon = parse_args(ctx.args)
+def prob_model(feat: dict, tf: str) -> int:
+    # Heurística simple + “capas” por horizonte
+    score = 0
+    p = feat["price"]; ema20 = feat["ema20"]
+    if not (np.isnan(p) or np.isnan(ema20)):
+        score += 1 if p > ema20 else -1
+    s50, s200 = feat["sma50"], feat["sma200"]
+    if not (np.isnan(s50) or np.isnan(s200)):
+        score += 1 if s50 > s200 else -1
+    if not np.isnan(feat["macd_hist"]):
+        score += 1 if feat["macd_hist"] > 0 else -1
+    r = feat["rsi14"]
+    if not np.isnan(r):
+        if r > 70: score -= 1
+        elif r > 50: score += 1
+        elif r < 30: score -= 1
+    base = 50 + 10*score
+    base = max(5, min(95, base))
+    caps = {"h": (35, 65), "d": (40, 60), "w": (45, 55), "m": (47, 53), "y": (48, 52)}
+    lo, hi = caps.get(tf, (40, 60))
+    return int(min(hi, max(lo, base)))
+
+# -------------------- Render --------------------
+def render_one(tf: str) -> str:
     try:
-        last, tags = build_ta_summary(t, interval)
-        emp = empirical_prob_now(t, interval, horizon)
-        if emp.get("mode")=="empirical":
-            p_up, p_dn = emp["p_up"], emp["p_dn"]
-            lo, hi, n = emp["ci_low"], emp["ci_high"], emp["n"]
-            prob_line = (f"• Prob. histórica {horizon.upper()}: ⬆️ <b>{p_up*100:,.1f}%</b>  |  "
-                         f"⬇️ <b>{p_dn*100:,.1f}%</b> (n={n}, IC95% {lo*100:,.1f}–{hi*100:,.1f}%)")
+        df = fetch_candles_for_tf(TRX_CANONICAL, tf)
+        feat = ta_features(df, TRX_CANONICAL, tf)
+        prob_up = prob_model(feat, tf)
+        txt = []
+        txt.append(f"TRX-USD [{tf}] — Última vela: {feat['ts_local']} ({feat['ts_utc']})")
+
+        # 1) Precio
+        txt.append(f"• Precio: {fmt(feat['price'], 4)}")
+
+        # 2) Tendencia (SMA/EMA)
+        if tf == "y":
+            alt_trend = "—"
+            if not np.isnan(feat.get("sma12m", np.nan)) and not np.isnan(feat.get("sma24m", np.nan)):
+                alt_trend = "Alcista (12>24)" if feat["sma12m"] > feat["sma24m"] else "Bajista (12<=24)"
+            txt.append(f"• SMA12/SMA24 (meses): {fmt(feat.get('sma12m'),4)} / {fmt(feat.get('sma24m'),4)} → {alt_trend}")
+            if np.isnan(feat['sma200']):
+                txt.append("• SMA200 (meses): —  · TRX aún no tiene ≥200 meses")
+            else:
+                txt.append(f"• SMA200 (meses): {fmt(feat['sma200'],4)}")
         else:
-            # respaldo heurístico
-            rsi_comp   = (50.0 - last["rsi"])/20.0
-            macd_unit  = (last["macd_hist"]/max(1e-8,last["price"])) / 0.005
-            trend_comp = (last["sma50"]-last["sma200"])/max(1e-8,last["sma200"])
-            boll_comp  = - last["band_pos"]
-            ema_comp   = 0.5 if last["price"]>last["ema20"] else -0.5
-            S = 0.9*rsi_comp + 0.8*macd_unit + 1.0*trend_comp + 0.7*boll_comp + 0.6*ema_comp
-            k = {"1d":0.9, "1w":0.7, "1m":0.5, "1y":0.3}[horizon]
-            p_up = 1/(1+math.exp(-k*S)); p_dn = 1-p_up
-            prob_line = f"• Prob. educativa {horizon.upper()}: ⬆️ <b>{p_up*100:,.1f}%</b>  |  ⬇️ <b>{p_dn*100:,.1f}%</b> (heurístico)"
+            txt.append(f"• SMA50/SMA200: {fmt(feat['sma50'],4)} / {fmt(feat['sma200'],4)} → {label_trend(feat['sma50'], feat['sma200'])}")
 
-        def fmt(dt): return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-        txt=(
-            f"<b>{safe(t)}</b> — velas [{safe(interval)}], horizonte [{safe(horizon)}]\n"
-            f"• <b>Actualizado:</b> {safe(fmt(last['now_local']))}\n"
-            f"• <b>Última vela:</b> {safe(fmt(last['candle_local']))} (UTC {safe(fmt(last['candle_utc']))})\n"
-            f"• Precio: <b>{last['price']:,.2f}</b>\n"
-            f"• RSI14: <b>{last['rsi']:.1f}</b> → <b>{safe(tags['rsi'])}</b>\n"
-            f"• MACD: línea {'&gt;' if last['macd_line']>last['macd_sig'] else '&lt;'} señal → <b>{safe(tags['macd'])}</b>\n"
-            f"• Bollinger (20,2): pos={last['band_pos']:+.2f} → <b>{safe(tags['boll'])}</b>\n"
-            f"• SMA50/SMA200: {last['sma50']:,.2f} / {last['sma200']:,.2f} → <b>{safe(tags['trend'])}</b>\n"
-            f"• EMA20: {last['ema20']:,.2f} → <b>{safe(tags['ema20'])}</b>\n"
-            f"{prob_line}\n"
-            f"<i>Uso educativo; no asesoría financiera.</i>"
-        )
-        await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+        if not (np.isnan(feat['ema20']) or np.isnan(feat['price'])):
+            txt.append(f"• EMA20: {fmt(feat['ema20'],4)} → {'Precio>EMA20' if feat['price']>feat['ema20'] else 'Precio<EMA20'}")
+        else:
+            txt.append("• EMA20: —")
+
+        # 3) RSI
+        txt.append(f"• RSI14: {fmt(feat['rsi14'])} → {label_rsi(feat['rsi14'])}")
+
+        # 4) MACD
+        txt.append(f"• MACD: {label_macd(feat['macd_line'], feat['macd_signal'])}")
+
+        # 5) Bollinger
+        if not np.isnan(feat["bb_pos"]):
+            txt.append(f"• Bollinger (20,2): pos={fmt(feat['bb_pos'],2)} → {label_bollinger(feat['bb_pos'])}")
+        else:
+            txt.append("• Bollinger (20,2): —")
+
+        # 6) Probabilidad
+        txt.append(f"• Prob. próxima vela: ⬆️ {prob_up}%  |  ⬇️ {100-prob_up}%")
+        return "\n".join(txt)
     except Exception as e:
-        try:
-            await update.message.reply_text(f"No pude calcular /info para {t}. Detalle: {str(e)}")
-        except Exception:
-            pass
+        return f"TRX-USD [{tf}]: no pude calcular ({e})"
 
-# =================== Telegram Application ===================
-if not BOT_TOKEN:
-    raise RuntimeError("Falta BOT_TOKEN (defínelo en Render).")
+# -------------------- Telegram --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "Bienvenido al bot de análisis técnico de TRX (TRON).\n\n"
+        "Comandos disponibles:\n"
+        "/info TRX h   (intradía por horas)\n"
+        "/info TRX d   (diario)\n"
+        "/info TRX w   (semanal)\n"
+        "/info TRX m   (mensual)\n"
+        "/info TRX y   (anual con velas mensuales)\n\n"
+        "Nota: Solo con propósitos informativos. No es asesoría financiera."
+    )
+    await update.message.reply_text(msg)
 
-application = Application.builder().token(BOT_TOKEN).build()
-application.add_handler(CommandHandler("start", cmd_start))
-application.add_handler(CommandHandler("info",  cmd_info))
+async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if len(args) != 2:
+        await update.message.reply_text("Formato: /info TRX TF (TF: h, d, w, m, y). Ej: /info TRX d")
+        return
 
-# =================== FastAPI + Webhook ===================
-app = FastAPI()
+    raw_ticker, tf = args[0], args[1].lower()
+    if not is_trx(raw_ticker):
+        await update.message.reply_text("Este bot es SOLO para TRON (TRX). Usa: /info TRX d (por ejemplo).")
+        return
+    if tf not in VALID_TF:
+        await update.message.reply_text("Timeframe no válido. Usa: h, d, w, m, y.")
+        return
 
-@app.on_event("startup")
-async def _startup():
-    await application.initialize()
-    await application.start()
-    if PUBLIC_URL:
-        await application.bot.set_webhook(url=f"{PUBLIC_URL}/webhook/{BOT_TOKEN}")
+    local, utc = ts_local_utc()
+    header = f"TRX-USD — análisis\nActualizado: {local} ({utc})\n"
+    block = render_one(tf)
+    footer = "\nSolo con propósitos informativos. No es asesoría financiera."
+    await update.message.reply_text(header + "\n" + block + footer)
 
-@app.on_event("shutdown")
-async def _shutdown():
-    await application.stop()
-    await application.shutdown()
+# -------------------- Main --------------------
+def main():
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise RuntimeError('Falta BOT_TOKEN (export BOT_TOKEN="TU_TOKEN")')
+    app = ApplicationBuilder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("info", info_handler))
+    print("Bot corriendo… (Ctrl+C para salir)")
+    app.run_polling(drop_pending_updates=True, poll_interval=0.1)
 
-@app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request):
-    if token != BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido")
-    data = await request.json()
-    update = Update.de_json(data, application.bot)
-    await application.update_queue.put(update)
-    return PlainTextResponse("OK")
-
-@app.get("/")
-def root():
-    return { "status": "ok", "app": APP_NAME }
+if __name__ == "__main__":
+    main()
