@@ -1,6 +1,6 @@
 python-telegram-bot==21.4
+fastapi
+uvicorn
 yfinance
 pandas
 numpy
-fastapi
-uvicorn
